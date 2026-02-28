@@ -30,7 +30,7 @@
 #define I2C_MASTER_SDA_IO       GPIO_NUM_4
 #define I2C_MASTER_SCL_IO       GPIO_NUM_5
 #define I2C_MASTER_FREQ_HZ      400000
-#define I2C_PORT_NUM            I2C_NUM_0
+#define I2C_MASTER_NUM          I2C_NUM_0
 
 // UART (气压传感器)
 #define UART_TX_PIN             GPIO_NUM_15   // 接传感器的 RX
@@ -39,3 +39,22 @@
 #define UART_BAUD_RATE          9600
 
 #endif // HARDWARE_CONFIG_H
+
+// ==========================================
+// 4. 控制参数
+// ==========================================
+#define BASE_PRESSURE           300.0f  // 基础气压 (kPa)
+
+// ==========================================
+// 5. 多路选择器引脚 (MUX) 
+// ==========================================
+
+// 角度传感器 MUX 控制脚 (对应 A, B, C)
+#define MUX_AS5600_A            GPIO_NUM_35
+#define MUX_AS5600_B            GPIO_NUM_36
+#define MUX_AS5600_C            GPIO_NUM_37
+
+// 气压传感器 MUX 控制脚 (对应 A, B, C)
+#define MUX_PRESS_A             GPIO_NUM_38
+#define MUX_PRESS_B             GPIO_NUM_39
+#define MUX_PRESS_C             GPIO_NUM_40
