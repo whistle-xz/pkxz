@@ -3,92 +3,102 @@
 #include "kalman.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
-#include "driver/gpio.h"
 
 static const char *TAG = "AS5600";
 #define AS5600_ADDR 0x36
 #define REG_ANGLE_H 0x0E
-#define REG_ANGLE_L 0x0F
 
-static KalmanFilter kf;
-static uint16_t zero_offset = 0;
-static uint8_t zero_set_flag = 0;
+static KalmanFilter kf_upper; // 大臂卡尔曼
+static KalmanFilter kf_lower; // 小臂卡尔曼
+static uint16_t zero_offset[2] = {0, 0}; 
+static uint8_t zero_set_flag[2] = {0, 0};
 
-// 多路选择器通道切换
-static void as5600_select_channel(int channel) {
-    // 根据 hardware_config.h 中的定义设置 GPIO
-    gpio_set_level(MUX_AS5600_A, channel & 0x01);
-    gpio_set_level(MUX_AS5600_B, (channel >> 1) & 0x01);
-    gpio_set_level(MUX_AS5600_C, (channel >> 2) & 0x01);
-}
+#define OFFSET_UPPER_RAW  2700  // 大臂绝对零点
+#define OFFSET_LOWER_RAW  94    // 小臂绝对零点
 
 void as5600_init(void) {
-    // 1. 配置 I2C
-    i2c_config_t conf = {
+    // 1. 初始化大臂编码器所在的 I2C_0
+    i2c_config_t conf0 = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_io_num = I2C0_SDA_IO,
+        .scl_io_num = I2C0_SCL_IO,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-    i2c_param_config(I2C_MASTER_NUM, &conf);
-    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    i2c_param_config(I2C_PORT_UPPER, &conf0);
+    i2c_driver_install(I2C_PORT_UPPER, conf0.mode, 0, 0, 0);
 
-    // 2. 配置多路选择器引脚
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL<<MUX_AS5600_A) | (1ULL<<MUX_AS5600_B) | (1ULL<<MUX_AS5600_C),
-        .pull_down_en = 0,
-        .pull_up_en = 0,
+    // 2. 初始化小臂编码器所在的 I2C_1
+    i2c_config_t conf1 = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C1_SDA_IO,
+        .scl_io_num = I2C1_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-    gpio_config(&io_conf);
+    i2c_param_config(I2C_PORT_LOWER, &conf1);
+    i2c_driver_install(I2C_PORT_LOWER, conf1.mode, 0, 0, 0);
 
-    // 3. 初始化卡尔曼滤波
-    kf_init(&kf, 0, 2, 1, 1);
+    // 3. 初始化两组卡尔曼滤波
+    kf_init(&kf_upper, 0, 2, 1, 1);
+    kf_init(&kf_lower, 0, 2, 1, 1);
     
-    ESP_LOGI(TAG, "AS5600 Sensor Initialized");
+    ESP_LOGI(TAG, "Dual AS5600 Sensors Initialized on I2C0 and I2C1");
 }
 
-static uint16_t read_raw_angle() {
-    uint8_t data[2];
-    uint8_t reg = REG_ANGLE_H; // 从高位寄存器开始读
+// 核心读取函数，根据传入的通道选择不同的 I2C 端口
+static uint16_t read_raw_angle(int channel) {
+    uint8_t data[2] = {0};
+    uint8_t reg = REG_ANGLE_H; 
     
-    // I2C 写地址
-    i2c_master_write_read_device(I2C_MASTER_NUM, AS5600_ADDR, &reg, 1, data, 2, pdMS_TO_TICKS(100));
+    // 动态选择使用哪个 I2C 接口
+    i2c_port_t i2c_port = (channel == 0) ? I2C_PORT_UPPER : I2C_PORT_LOWER;
     
-    // 拼接高低位 (AS5600 数据格式: HighByte << 8 | LowByte)
-    // 注意：你队友的代码是先读L再读H，标准做法通常是一次读2字节或者按序读
-    // 这里使用标准 I2C 读取
-    uint16_t angle = ((data[0] << 8) | data[1]) & 0x0FFF; // 12位精度
-    return angle;
+    // 读数据
+    esp_err_t err = i2c_master_write_read_device(i2c_port, AS5600_ADDR, &reg, 1, data, 2, pdMS_TO_TICKS(10));
+    
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "CH%d Read Failed!", channel);
+        return 0; // 传感器可能没接好
+    }
+    
+    return ((data[0] << 8) | data[1]) & 0x0FFF; 
 }
 
-void as5600_set_zero(void) {
-    as5600_select_channel(0); // 默认校准通道0
-    uint16_t raw = read_raw_angle();
-    zero_offset = raw;
-    zero_set_flag = 1;
-    ESP_LOGI(TAG, "Zero Point Set: %d", zero_offset);
+void as5600_set_zero(int channel) {
+    if (channel < 0 || channel > 1) return;
+    
+    zero_offset[channel] = read_raw_angle(channel);
+    zero_set_flag[channel] = 1;
+    ESP_LOGI(TAG, "Zero Point Set for CH%d: %d", channel, zero_offset[channel]);
 }
 
 int16_t as5600_get_angle(int channel) {
-    as5600_select_channel(channel);
-    
-    uint16_t raw = read_raw_angle();
-    
-    // 卡尔曼滤波
-    float filtered = kf_update(&kf, (float)raw);
-    
-    if (!zero_set_flag) return 0;
+    if (channel < 0 || channel > 1) return 0;
 
-    // 计算相对角度
-    int32_t diff = (int32_t)filtered - (int32_t)zero_offset;
+    uint16_t raw = read_raw_angle(channel);
     
-    // 处理过零点问题 (0-4096 回绕)
+    KalmanFilter *kf = (channel == 0) ? &kf_upper : &kf_lower;
+    float filtered = kf_update(kf, (float)raw);
+    
+    // 【核心修改 1】：抛弃 zero_offset 数组和标志位，直接强行使用绝对零点！
+    int32_t offset = (channel == 0) ? OFFSET_UPPER_RAW : OFFSET_LOWER_RAW;
+    int32_t diff = (int32_t)filtered - offset;
+
+    
+    // 处理过零点回绕 (0-4096)
     if (diff > 2048) diff -= 4096;
     else if (diff < -2048) diff += 4096;
 
-    return (int16_t)diff;
+    float degree = (diff * 360.0f) / 4096.0f;
+    
+    // 【核心修改 2】：统一坐标系方向
+    // 根据上一轮的分析，为了和你的 3D 运动学模型完全对齐，大小臂都需要反转！
+    if (channel == 0) {
+        return (int16_t)(-degree); // 大臂：往前倾斜为正
+    } else {
+        return (int16_t)(degree); // 小臂：往下垂为正，往上收缩(夹角变小)为负
+    }
 }

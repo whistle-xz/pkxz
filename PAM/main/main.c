@@ -6,62 +6,71 @@
 #include "hardware_config.h"
 #include "hal_pump.h"
 #include "hal_valves.h"
-#include "as5600.h"
 #include "press.h"
 #include "arm_control.h"
+#include "serial_debug.h"
+#include "stm32_comm.h"
 
 static const char *TAG = "MAIN";
 void app_main(void) {
     ESP_LOGI(TAG, "========= PAM Robot Arm System Start =========");
+    
+    // ================= 第 0 步：强行夺取 GPIO 6 和 7 的控制权 =================
+    // 无论框架默认把它们当成了什么(I2C等)，强行复位并拉低！
+    gpio_reset_pin(6);
+    gpio_set_direction(6, GPIO_MODE_OUTPUT);
+    gpio_set_level(6, 0); 
 
-    // --- 1. 硬件抽象层 (HAL) 初始化 ---
-    ESP_LOGI(TAG, "[1/3] Initializing HAL...");
-    pump_init();    // 气泵 & 压力开关
-    valves_init();  // 电磁阀 PWM
+    gpio_reset_pin(7);
+    gpio_set_direction(7, GPIO_MODE_OUTPUT);
+    gpio_set_level(7, 0);
+    
+    // 1. 初始化硬件
+    pump_init();
+    valves_init();
 
-    // --- 2. 传感器层初始化 ---
-    ESP_LOGI(TAG, "[2/3] Initializing Sensors...");
-    as5600_init();          // 角度传感器
-    pressure_sensor_init(); // 气压传感器
+    // 2. 初始化传感器
+    pressure_sensor_init();
 
-    // --- 3. 控制层初始化 ---
-    ESP_LOGI(TAG, "[3/3] Initializing Control System...");
-    arm_control_init();     // PID 参数初始化
+    // 3. 初始化控制算法
+    arm_control_init();
 
-    // --- 4. 启动 RTOS 任务 ---
+    // 4. 启动任务
     ESP_LOGI(TAG, "Starting Tasks...");
 
-    // 任务 A: 气泵自动保压任务 (优先级 4)
-    // 负责监控储气罐压力，自动启停气泵
+    // 任务 A: 气泵保压
+    xTaskCreate(pump_control_loop, "Pump_Task", 2048, NULL, 4, NULL);
+
+    // 【新增】任务 S: 传感器读取与滤波任务 (优先级最高，确保数据不断更)
+    xTaskCreate(sensor_task, "Sensor_Task", 4096, NULL, 6, NULL);
+
+    // 任务 B: 机械臂控制
+    xTaskCreate(arm_control_task, "Arm_Ctrl_Task", 4096, NULL, 5, NULL);
+
+    // 任务 C: USB 串口调试任务
     xTaskCreate(
-        (TaskFunction_t)pump_control_loop, // 任务函数 (注意: 之前pump_control_loop如果是死循环直接用，如果不是需封装)
-        "Pump_Task",                       // 任务名
-        2048,                              // 栈大小
-        NULL,                              // 参数
-        4,                                 // 优先级
-        NULL                               // 句柄
+        cli_task,       // 任务函数
+        "CLI_Task",     // 任务名
+        4096,           // 栈大小
+        NULL,           // 参数
+        3,              // 优先级
+        NULL            // 句柄
     );
-
-    // 任务 B: 机械臂核心运动控制任务 (优先级 5 - 实时性高)
-    // 负责 50Hz 的 PID 计算和阀门控制
+    
+    
+    // 【新增】任务 D: STM32 串口通讯任务
     xTaskCreate(
-        arm_control_task,
-        "Arm_Ctrl_Task",
-        4096,
-        NULL,
-        5,
-        NULL
+        stm32_comm_task,   // 任务函数
+        "STM32_Comm",      // 任务名
+        4096,              // 栈大小
+        NULL,              // 参数
+        4,                 // 优先级 (设为4，比 CLI 高一点，保证通讯不掉线)
+        NULL               // 句柄
     );
-
-    // 测试动作：让机械臂动起来
-    // 延时 2 秒等待系统稳定
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "Command: Go to 30 degrees");
-    arm_set_target_angle(30.0f);
-
+    ESP_LOGI(TAG, "All Tasks Started.");
+    
+    // 主循环保持存活
     while (1) {
-        // 主循环每 1 秒打印一次存活信息
-        // 实际应用中可以处理 USB 命令或 WIFI 通信
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

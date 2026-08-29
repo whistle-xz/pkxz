@@ -1,5 +1,3 @@
-//全局硬件配置头文件，定义引脚和外设参数
-
 #ifndef HARDWARE_CONFIG_H
 #define HARDWARE_CONFIG_H
 
@@ -8,53 +6,69 @@
 #include "driver/uart.h"
 #include "driver/i2c.h"
 
-// 1. 气泵与压力开关 (QPM11)
-#define PUMP_RELAY_PIN          GPIO_NUM_14   // 气泵继电器控制引脚
-#define PRESSURE_SWITCH_PIN     GPIO_NUM_21   // QPM11 压力开关引脚 (NC常闭: 低压闭合/高压断开)
+// ================= 1. 气泵与压力开关 =================
+#define PUMP_RELAY_PIN          GPIO_NUM_14   // 气泵继电器
+#define PRESSURE_SWITCH_PIN     GPIO_NUM_21   // QPM11 压力开关 (注意：避免与其他针脚冲突)
 
-// 2. 电磁阀 PWM 配置 (两位三通阀)
-#define VALVE_PWM_FREQ_HZ       50            // 50Hz
-#define VALVE_LEDC_TIMER        LEDC_TIMER_0
-#define VALVE_LEDC_MODE         LEDC_LOW_SPEED_MODE
-#define VALVE_LEDC_RES          LEDC_TIMER_13_BIT // 13位分辨率 (0-8191)
-#define VALVE_MAX_DUTY          8191
-
-// 使用 ESP32-S3 侧边排列的 GPIO，避开 USB 和 JTAG
-#define VALVE_A_IN_PIN          GPIO_NUM_10   // 肌肉A 进气阀
-#define VALVE_A_OUT_PIN         GPIO_NUM_11   // 肌肉A 排气阀 
-#define VALVE_B_IN_PIN          GPIO_NUM_12   // 肌肉B 进气阀
-#define VALVE_B_OUT_PIN         GPIO_NUM_13   // 肌肉B 排气阀
-
-// 3. 传感器通信引脚
-// I2C (AS5600 角度)
-#define I2C_MASTER_SDA_IO       GPIO_NUM_4
-#define I2C_MASTER_SCL_IO       GPIO_NUM_5
+/// ================= 2. I2C 编码器 (AS5600) =================
 #define I2C_MASTER_FREQ_HZ      400000
-#define I2C_MASTER_NUM          I2C_NUM_0
 
-// UART (气压传感器)
-#define UART_TX_PIN             GPIO_NUM_15   // 接传感器的 RX
-#define UART_RX_PIN             GPIO_NUM_16   // 接传感器的 TX
-#define UART_PORT_NUM           UART_NUM_1
+// 编码器 1 (大臂关节) - 使用 I2C_0
+#define I2C_PORT_UPPER          I2C_NUM_0
+#define I2C0_SDA_IO             GPIO_NUM_8    // 传感器1的 SDA
+#define I2C0_SCL_IO             GPIO_NUM_9    // 传感器1的 SCL
+
+// 编码器 2 (小臂关节) - 使用 I2C_1
+#define I2C_PORT_LOWER          I2C_NUM_1
+#define I2C1_SDA_IO             GPIO_NUM_1   // 传感器2的 SDA (确保空闲)
+#define I2C1_SCL_IO             GPIO_NUM_2   // 传感器2的 SCL (确保空闲)
+
+// ================= 3. 电磁阀 PWM 配置 (8 个气阀) =================
+#define VALVE_PWM_FREQ_HZ       25            
+#define VALVE_LEDC_RES          LEDC_TIMER_13_BIT 
+#define VALVE_MAX_DUTY          8191
+#define VALVE_LEDC_MODE         LEDC_LOW_SPEED_MODE
+
+// 大臂气阀 (原肌肉 A/B)
+#define VALVE_1_PIN             GPIO_NUM_10   // V1 : A 充气
+#define VALVE_2_PIN             GPIO_NUM_11   // V2 : B 充气
+#define VALVE_3_PIN             GPIO_NUM_12   // V3 : A 排气
+#define VALVE_4_PIN             GPIO_NUM_13   // V4 : B 排气
+
+// 小臂气阀 (新增肌肉 C/D)
+#define VALVE_5_PIN             GPIO_NUM_4    // V5 : C 充气 (确保此引脚空闲)
+#define VALVE_6_PIN             GPIO_NUM_5    // V6 : D 充气
+#define VALVE_7_PIN             GPIO_NUM_6    // V7 : C 排气
+#define VALVE_8_PIN             GPIO_NUM_7    // V8 : D 排气
+
+// --- 通道号定义 (用于控制 valve_set_duty) ---
+#define VALVE_A_INFLATE_CH      0
+#define VALVE_B_INFLATE_CH      1
+#define VALVE_A_EXHAUST_CH      2
+#define VALVE_B_EXHAUST_CH      3
+#define VALVE_C_INFLATE_CH      4
+#define VALVE_D_INFLATE_CH      5
+#define VALVE_C_EXHAUST_CH      6
+#define VALVE_D_EXHAUST_CH      7
+
+// ================= 4. 传感器通信引脚 (UART) =================
+// 气压传感器 A
+#define UART1_PORT_NUM          UART_NUM_1
+#define UART1_TX_PIN            GPIO_NUM_15   
+#define UART1_RX_PIN            GPIO_NUM_16   
+
+// 气压传感器 B
+#define UART2_PORT_NUM          UART_NUM_2
+#define UART2_TX_PIN            GPIO_NUM_17   
+#define UART2_RX_PIN            GPIO_NUM_18   
 #define UART_BAUD_RATE          9600
 
-#endif // HARDWARE_CONFIG_H
+// ================= 5. 与 STM32 通讯的 UART0 配置 =================
+#define UART0_PORT_NUM          UART_NUM_0
+#define UART0_TX_PIN            GPIO_NUM_43   // 接 STM32 的 USART6_RX
+#define UART0_RX_PIN            GPIO_NUM_44   // 接 STM32 的 USART6_TX
 
-// ==========================================
-// 4. 控制参数
-// ==========================================
-#define BASE_PRESSURE           300.0f  // 基础气压 (kPa)
+// ================= 6. 控制参数 =================                  
+#define BASE_PRESSURE           260.0f  // 基础气压 (kPa)
 
-// ==========================================
-// 5. 多路选择器引脚 (MUX) 
-// ==========================================
-
-// 角度传感器 MUX 控制脚 (对应 A, B, C)
-#define MUX_AS5600_A            GPIO_NUM_35
-#define MUX_AS5600_B            GPIO_NUM_36
-#define MUX_AS5600_C            GPIO_NUM_37
-
-// 气压传感器 MUX 控制脚 (对应 A, B, C)
-#define MUX_PRESS_A             GPIO_NUM_38
-#define MUX_PRESS_B             GPIO_NUM_39
-#define MUX_PRESS_C             GPIO_NUM_40
+#endif 

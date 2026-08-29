@@ -1,38 +1,23 @@
 #include "press.h"
 #include "hardware_config.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #include "esp_log.h"
-#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "kalman.h"  
 
 static const char *TAG = "PRESS_SENSOR";
-#define BUF_SIZE 1024
 
-// 协议命令
-#define CMD_CAL_P1 0x0D // 获取实时气压
+// 全局变量，保存最新滤波后的气压值
+static volatile uint32_t current_press_A = 0;
+static volatile uint32_t current_press_B = 0;
 
-// 多路选择
-static void press_select_channel(int channel) {
-    gpio_set_level(MUX_PRESS_A, channel & 0x01);
-    gpio_set_level(MUX_PRESS_B, (channel >> 1) & 0x01);
-    gpio_set_level(MUX_PRESS_C, (channel >> 2) & 0x01);
-}
-
-// CRC 校验算法 
-static uint8_t calc_crc(uint8_t *arr, uint8_t len) {
-    uint8_t crc = 0;
-    while (len--) {
-        crc ^= *arr++;
-        for (int i = 0; i < 8; i++) {
-            if (crc & 0x01) crc = (crc >> 1) ^ 0x8c;
-            else crc >>= 1;
-        }
-    }
-    return crc;
-}
+// 定义卡尔曼滤波器实例
+static KalmanFilter kf_A;
+static KalmanFilter kf_B;
 
 void pressure_sensor_init(void) {
-    // 1. 配置 UART
+    // ... [保留你原有的 UART 初始化代码保持不变] ...
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -41,49 +26,66 @@ void pressure_sensor_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_install(UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(UART_PORT_NUM, &uart_config);
-    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, -1, -1);
-
-    // 2. 配置 MUX 引脚
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL<<MUX_PRESS_A) | (1ULL<<MUX_PRESS_B) | (1ULL<<MUX_PRESS_C),
-        .pull_down_en = 0,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
     
-    ESP_LOGI(TAG, "Pressure Sensor Initialized");
+    ESP_ERROR_CHECK(uart_driver_install(UART1_PORT_NUM, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART1_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART1_PORT_NUM, UART1_TX_PIN, UART1_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    ESP_ERROR_CHECK(uart_driver_install(UART2_PORT_NUM, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART2_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART2_PORT_NUM, UART2_TX_PIN, UART2_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    
+    // 初始化卡尔曼滤波器 
+    // 参数：(实例, 初始值, 初始协方差P, 过程噪声Q, 测量噪声R)
+    // Q越小越平滑，R越大越平滑。你可以根据实际抖动调整 Q 和 R
+    kf_init(&kf_A, BASE_PRESSURE, 1.0f, 0.1f, 5.0f); 
+    kf_init(&kf_B, BASE_PRESSURE, 1.0f, 0.1f, 5.0f);
+
+    ESP_LOGI(TAG, "Pressure Sensors UART & Kalman Filter Initialized");
 }
 
-uint32_t pressure_read_kpa(int channel) {
-    press_select_channel(channel);
+// 内部函数：读取单次原始气压 (去掉了冗长的错误打印，避免刷屏)
+static uint32_t read_raw_pressure(int channel) {
+    uart_port_t uart_num = (channel == 0) ? UART1_PORT_NUM : UART2_PORT_NUM;
+    uint8_t data[32];
     
-    // 1. 发送读取命令
-    uint8_t cmd_buf[4] = {0x55, 0x04, CMD_CAL_P1, 0x00};
-    cmd_buf[3] = calc_crc(cmd_buf, 3);
-    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_buf, 4);
+    uart_flush_input(uart_num); 
+    uint8_t cmd_press[4] = {0x55, 0x04, 0x0D, 0x88};
+    uart_write_bytes(uart_num, (const char *)cmd_press, 4);
 
-    // 2. 等待响应
-    vTaskDelay(pdMS_TO_TICKS(50)); // 传感器处理时间
+    // 超时时间缩短为 30ms，保证循环帧率
+    int len = uart_read_bytes(uart_num, data, 32, pdMS_TO_TICKS(30));
 
-    // 3. 读取数据
-    uint8_t data[128];
-    int len = uart_read_bytes(UART_PORT_NUM, data, BUF_SIZE, pdMS_TO_TICKS(50));
-
-    if (len >= 5 && data[0] == 0xAA) {
-        // 解析: AA(头) Len Type Data...
-        // 假设数据类型是 P1 (0x09)
-        // 注意数组索引保护
-        if (len >= 8) { // 确保有足够数据
-             uint32_t pressure = (data[5] << 16) | (data[4] << 8) | (data[3]);
-             return pressure / 1000; // 返回 kPa
-        }
+    if (len >= 8 && data[0] == 0xAA && data[2] == 0x09) { 
+        uint32_t pressure_raw = (data[5] << 16) | (data[4] << 8) | (data[3]);
+        uint32_t pressure_kpa = pressure_raw / 1000; 
+        if (pressure_kpa > 800) return PRESS_SENSOR_ERROR;
+        return pressure_kpa;
     }
-    
-    // 读不到返回一个错误码或者上一次的值 (这里返回0表示异常)
-    // ESP_LOGW(TAG, "Press Read Fail Ch:%d", channel);
-    return 0; 
+    return PRESS_SENSOR_ERROR;
+}
+
+// 供外部极速读取的接口
+uint32_t get_filtered_pressure(int channel) {
+    return (channel == 0) ? current_press_A : current_press_B;
+}
+
+// 独立的传感器读取任务
+void sensor_task(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50Hz 读取频率
+
+    while (1) {
+        uint32_t raw_A = read_raw_pressure(0);
+        uint32_t raw_B = read_raw_pressure(1);
+
+        if (raw_A != PRESS_SENSOR_ERROR) {
+            current_press_A = (uint32_t)kf_update(&kf_A, (float)raw_A);
+        }
+        if (raw_B != PRESS_SENSOR_ERROR) {
+            current_press_B = (uint32_t)kf_update(&kf_B, (float)raw_B);
+        }
+
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
 }
